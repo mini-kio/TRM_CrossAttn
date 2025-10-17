@@ -40,3 +40,8 @@ min_eval_interval: 0 # when to start the eval
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+
+# Mixed precision & accumulation
+amp: False           # Enable AMP (autocast + GradScaler)
+amp_dtype: float16   # autocast dtype: float16 or bfloat16
+grad_accum_steps: 1  # Not used yet; placeholder

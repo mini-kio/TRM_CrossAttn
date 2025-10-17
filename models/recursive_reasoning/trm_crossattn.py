@@ -2,13 +2,11 @@ from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
-import copy
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
-import random
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, CrossAttention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import rms_norm, SwiGLU, Attention, CrossAttention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -61,6 +59,9 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    
+    # Memory-saving options
+    gradient_checkpointing: bool = False  # Enable activation checkpointing for reasoning layers
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -191,13 +192,34 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.bias.fill_(-5)  # type: ignore
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        # Validate inputs to prevent CUDA index out of bounds errors
+        input_int = input.to(torch.int32)
+
+        # Check and clamp input token IDs
+        if torch.any(input_int < 0) or torch.any(input_int >= self.config.vocab_size):
+            invalid_mask = (input_int < 0) | (input_int >= self.config.vocab_size)
+            invalid_count = invalid_mask.sum().item()
+            invalid_values = input_int[invalid_mask][:10]  # Show first 10 invalid values
+            print(f"WARNING: Found {invalid_count} invalid input token IDs. Range should be [0, {self.config.vocab_size})")
+            print(f"Sample invalid values: {invalid_values.tolist()}")
+            input_int = torch.clamp(input_int, 0, self.config.vocab_size - 1)
+
         # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        embedding = self.embed_tokens(input_int)
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:
+            # Check and clamp puzzle_identifiers
+            if torch.any(puzzle_identifiers < 0) or torch.any(puzzle_identifiers >= self.config.num_puzzle_identifiers):
+                invalid_mask = (puzzle_identifiers < 0) | (puzzle_identifiers >= self.config.num_puzzle_identifiers)
+                invalid_count = invalid_mask.sum().item()
+                invalid_values = puzzle_identifiers[invalid_mask][:10]
+                print(f"WARNING: Found {invalid_count} invalid puzzle_identifiers. Range should be [0, {self.config.num_puzzle_identifiers})")
+                print(f"Sample invalid values: {invalid_values.tolist()}")
+                puzzle_identifiers = torch.clamp(puzzle_identifiers, 0, self.config.num_puzzle_identifiers - 1)
+
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
+
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
@@ -250,10 +272,22 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 # z_H updates by attending to z_L via cross-attention
                 z_H = self.L_level(z_H, context=z_L, **seq_info)
 
-        # 1 with grad
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, context=input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, context=z_L, **seq_info)
+        # 1 with grad (optionally checkpointed)
+        if self.config.gradient_checkpointing:
+            from torch.utils.checkpoint import checkpoint
+
+            cos_sin = seq_info.get("cos_sin", None)
+
+            def run_l_level(hs: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+                return self.L_level(hidden_states=hs, context=ctx, cos_sin=cos_sin)
+
+            for _L_step in range(self.config.L_cycles):
+                z_L = checkpoint(run_l_level, z_L, input_embeddings, use_reentrant=False)
+            z_H = checkpoint(run_l_level, z_H, z_L, use_reentrant=False)
+        else:
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, context=input_embeddings, **seq_info)
+            z_H = self.L_level(z_H, context=z_L, **seq_info)
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad

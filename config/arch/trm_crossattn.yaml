@@ -1,3 +1,4 @@
+# @package _group_
 name: recursive_reasoning.trm_crossattn@TinyRecursiveReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
@@ -16,7 +17,8 @@ hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
 expansion: 4
 
-puzzle_emb_ndim: ${.hidden_size}
+# Avoid OmegaConf relative interpolation for older Hydra versions
+puzzle_emb_ndim: 512
 
 pos_encodings: rope
 forward_dtype: bfloat16
@@ -24,3 +26,6 @@ forward_dtype: bfloat16
 mlp_t: False # use mlp on L instead of transformer
 puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+# Memory saving
+gradient_checkpointing: False

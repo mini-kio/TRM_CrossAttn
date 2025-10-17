@@ -13,7 +13,7 @@ echo "Run name: $run_name"
 echo "Starting training..."
 
 # Train with 1 GPU (quick test)
-python pretrain.py \
+python3 pretrain.py \
   arch=trm_crossattn \
   data_paths="[data/sudoku-extreme-1k-aug-1000]" \
   evaluators="[]" \

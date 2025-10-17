@@ -12,7 +12,7 @@ mkdir -p data
 echo ""
 echo "[1/2] Building Maze-Hard dataset..."
 echo "  Output: data/maze-30x30-hard-1k"
-python dataset/build_maze_dataset.py
+python3 dataset/build_maze_dataset.py
 
 if [ $? -eq 0 ]; then
   echo "  ✓ Maze-Hard dataset created successfully!"
@@ -25,7 +25,7 @@ fi
 echo ""
 echo "[2/2] Building Sudoku-Extreme dataset..."
 echo "  Output: data/sudoku-extreme-1k-aug-1000"
-python dataset/build_sudoku_dataset.py \
+python3 dataset/build_sudoku_dataset.py \
   --output-dir data/sudoku-extreme-1k-aug-1000 \
   --subsample-size 1000 \
   --num-aug 1000

@@ -10,13 +10,14 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 
 import tqdm
 import wandb
 import coolname
 import hydra
 import pydantic
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
@@ -83,12 +84,20 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
+    # Mixed precision & accumulation
+    amp: bool = False  # Enable AMP (autocast + GradScaler)
+    amp_dtype: str = "float16"  # autocast dtype: float16 or bfloat16
+    grad_accum_steps: int = 1  # Gradient accumulation steps
+
 @dataclass
 class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
     carry: Any
+
+    amp_scaler: Optional[GradScaler]
+    amp_dtype: Optional[torch.dtype]
 
     step: int
     total_steps: int
@@ -160,7 +169,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     elif config.freeze_weights:
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
+                list(model.model.puzzle_emb.parameters()) + list(model.model.puzzle_emb.buffers()),  # type: ignore
                 lr=0,  # Needs to be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
@@ -172,7 +181,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     else:
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
-                model.model.puzzle_emb.buffers(),  # type: ignore
+                list(model.model.puzzle_emb.parameters()) + list(model.model.puzzle_emb.buffers()),  # type: ignore
                 lr=0,  # Needs to be set by scheduler
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
@@ -191,19 +200,6 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     return model, optimizers, optimizer_lrs
 
-def mix_weights_direct(device, alpha, net, nets):
-    sd = []
-    for i in range(len(nets)):
-        sd += [nets[i].state_dict()]
-    sd_alpha = {}
-    for k in sd[0].keys():
-        comb_net = alpha[0]*sd[0][k].to(device)
-        for i in range(1,len(nets)):
-            comb_net += alpha[i]*sd[i][k].to(device)
-        sd_alpha[k] =  comb_net
-    net.load_state_dict(sd_alpha)
-    return net
-
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
 ):
@@ -221,6 +217,10 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
 
+    # AMP objects
+    amp_dtype = getattr(torch, config.amp_dtype) if config.amp else None
+    amp_scaler: Optional[GradScaler] = GradScaler(device='cuda', enabled=config.amp)
+
     return TrainState(
         step=0,
         total_steps=total_steps,
@@ -228,7 +228,9 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+        amp_scaler=amp_scaler,
+        amp_dtype=amp_dtype
     )
 
 
@@ -299,13 +301,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    # Forward with optional AMP
+    if config.amp:
+        with autocast(device_type="cuda", dtype=train_state.amp_dtype):  # type: ignore[arg-type]
+            train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+        assert train_state.amp_scaler is not None
+        train_state.amp_scaler.scale((1 / global_batch_size) * loss).backward()
+    else:
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+        ((1 / global_batch_size) * loss).backward()
 
-    ((1 / global_batch_size) * loss).backward()
-
-    # Allreduce
+    # Allreduce (after unscale if AMP)
     if world_size > 1:
+        if config.amp and train_state.amp_scaler is not None:
+            for optim in train_state.optimizers:
+                train_state.amp_scaler.unscale_(optim)
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
@@ -317,9 +327,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-            
-        optim.step()
+
+        if config.amp and train_state.amp_scaler is not None:
+            train_state.amp_scaler.step(optim)
+        else:
+            optim.step()
         optim.zero_grad()
+
+    if config.amp and train_state.amp_scaler is not None:
+        train_state.amp_scaler.update()
 
     # Reduce metrics
     if len(metrics):
@@ -384,9 +400,15 @@ def evaluate(
             # Forward
             inference_steps = 0
             while True:
-                carry, loss, metrics, preds, all_finish = train_state.model(
-                    carry=carry, batch=batch, return_keys=return_keys
-                )
+                if config.amp:
+                    with autocast(device_type="cuda", dtype=train_state.amp_dtype):  # type: ignore[arg-type]
+                        carry, loss, metrics, preds, all_finish = train_state.model(
+                            carry=carry, batch=batch, return_keys=return_keys
+                        )
+                else:
+                    carry, loss, metrics, preds, all_finish = train_state.model(
+                        carry=carry, batch=batch, return_keys=return_keys
+                    )
                 inference_steps += 1
 
                 if all_finish:
@@ -514,7 +536,9 @@ def save_code_and_config(config: PretrainConfig):
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
     objects = [None]
     if rank == 0:
-        config = PretrainConfig(**hydra_config)  # type: ignore
+        # Resolve OmegaConf interpolations before constructing Pydantic config
+        resolved_cfg = OmegaConf.to_container(hydra_config, resolve=True)  # type: ignore
+        config = PretrainConfig(**resolved_cfg)  # type: ignore
 
         # Naming
         if config.project_name is None:
@@ -532,7 +556,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]  # type: ignore
 
 
-@hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
+@hydra.main(config_path="config", config_name="cfg_pretrain")
 def launch(hydra_config: DictConfig):
     RANK = 0
     WORLD_SIZE = 1

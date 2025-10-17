@@ -68,14 +68,22 @@ class CastedEmbedding(nn.Module):
                  cast_to: torch.dtype):
         super().__init__()
         self.cast_to = cast_to
+        self.num_embeddings = num_embeddings
 
         # Truncated LeCun normal init
         self.embedding_weight = nn.Parameter(
             trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std)
         )
-        
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input, self.embedding_weight.to(self.cast_to))
+        # Clamp input to valid range to prevent index out of bounds
+        input_clamped = torch.clamp(input, 0, self.num_embeddings - 1)
+
+        if not torch.equal(input, input_clamped):
+            print(f"WARNING in CastedEmbedding: Invalid indices detected. Valid range: [0, {self.num_embeddings})")
+            print(f"Min index: {input.min().item()}, Max index: {input.max().item()}")
+
+        return F.embedding(input_clamped, self.embedding_weight.to(self.cast_to))
 
 
 class RotaryEmbedding(nn.Module):
@@ -131,7 +139,7 @@ class Attention(nn.Module):
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
 class CrossAttention(nn.Module):
@@ -178,31 +186,9 @@ class CrossAttention(nn.Module):
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value))
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=False)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, query_len, self.output_size)
+        attn_output = attn_output.reshape(batch_size, query_len, self.output_size)
 
         return self.o_proj(attn_output)
-
-
-class LinearSwish(nn.Module):
-    def __init__(self, hidden_size: int, pre_act=False):
-        """
-        LinearSwish activation module
-
-        Args:
-            hidden_size: Hidden dimension size
-            pre_act: If True, applies linear then activation (Linear->SiLU)
-                    If False, applies activation then linear (SiLU->Linear)
-        """
-        super().__init__()
-
-        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
-        self.pre_act = pre_act
-
-    def forward(self, x):
-        if self.pre_act:
-            return F.silu(self.linear(x))
-        else:
-            return self.linear(F.silu(x))
 
 
 class SwiGLU(nn.Module):
@@ -217,23 +203,8 @@ class SwiGLU(nn.Module):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
-class RMSNorm(nn.Module):
-    """RMSNorm with learnable scale parameter for better convergence"""
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (x * self.weight).to(input_dtype)
-
-
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
-    """Legacy function-based RMSNorm - prefer using RMSNorm class for learnable scale"""
+    """Function-based RMSNorm normalization"""
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
 

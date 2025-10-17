@@ -28,14 +28,22 @@ class CastedSparseEmbedding(nn.Module):
         self.register_buffer("local_ids", torch.zeros(batch_size, dtype=torch.int32), persistent=False)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # Clamp inputs to valid range to prevent index out of bounds
+        num_embeddings = self.weights.shape[0]
+        inputs_clamped = torch.clamp(inputs, 0, num_embeddings - 1)
+
+        if not torch.equal(inputs, inputs_clamped):
+            print(f"WARNING in CastedSparseEmbedding: Invalid indices detected. Valid range: [0, {num_embeddings})")
+            print(f"Min index: {inputs.min().item()}, Max index: {inputs.max().item()}")
+
         if not self.training:
             # Test mode, no gradient
-            return self.weights[inputs].to(self.cast_to)
+            return self.weights[inputs_clamped].to(self.cast_to)
 
         # Training mode, fill puzzle embedding from weights
         with torch.no_grad():
-            self.local_weights.copy_(self.weights[inputs])
-            self.local_ids.copy_(inputs)
+            self.local_weights.copy_(self.weights[inputs_clamped])
+            self.local_ids.copy_(inputs_clamped)
 
         return self.local_weights.to(self.cast_to)
 

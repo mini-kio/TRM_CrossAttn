@@ -1,3 +1,4 @@
+# @package _group_
 name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
@@ -16,7 +17,8 @@ hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
 expansion: 4
 
-puzzle_emb_ndim: ${.hidden_size}
+# Avoid relative interpolation issues on some Hydra versions
+puzzle_emb_ndim: 512
 
 pos_encodings: rope
 forward_dtype: bfloat16
